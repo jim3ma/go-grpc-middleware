@@ -1,201 +1,117 @@
 package balancer
 
 import (
-	"encoding/binary"
-	"errors"
+	"context"
 	"fmt"
-	"sort"
+	"math/rand"
 	"sync"
+	"time"
+
+	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/balancer/base"
+	"google.golang.org/grpc/grpclog"
+
+	"github.com/grpc-ecosystem/go-grpc-middleware/util/consistentutils"
 )
 
-var (
-	ErrMemberAlreadyExists = errors.New("member node already exists")
-	ErrMemberNotFound      = errors.New("member node not found")
-	ErrNotEnoughMembers    = errors.New("not enough member nodes to satisfy request")
+const (
+	// ConsistentHashRingBalancerName is the name of consistent-hash-ring balancer.
+	ConsistentHashRingBalancerName = "consistent-hash-ring"
+
+	// ConsistentHashRingBalancerServiceConfig is a service config that sets the default balancer
+	// to the consistent-hash-ring balancer
+	ConsistentHashRingBalancerServiceConfig = `{"loadBalancingPolicy":"consistent-hash-ring"}`
+
+	// consistentHashRingCtxKey is the key for the grpc request's context.Context which points to
+	// the key to hash for the request. The value it points to must be []byte
+	consistentHashRingCtxKey string = "consistent-hash-ring-request-key"
 )
 
-// HasherFunc is the interface for any function that can act as a hasher.
-type HasherFunc func([]byte) uint64
+var logger = grpclog.Component("consistenthashring")
 
-// Member is the interface for any object that can be stored and retrieved as a
-// HashRing member (e.g. node/backend).
-type Member interface {
-	Key() string
+// NewConsistentHashRingBuilder creates a new balancer.Builder that
+// will create a consistent hash ring balancer with the given config.
+// Before making a connection, register it with grpc with:
+// `balancer.Register(consistent.NewConsistentHashRingBuilder(hasher, factor, spread))`
+func NewConsistentHashRingBuilder(hasher consistentutils.HasherFunc, replicationFactor uint16, spread uint8) balancer.Builder {
+	return base.NewBalancerBuilder(
+		ConsistentHashRingBalancerName,
+		&consistentHashRingPickerBuilder{hasher: hasher, replicationFactor: replicationFactor, spread: spread},
+		base.Config{HealthCheck: true},
+	)
 }
 
-// HashRing provides a ring consistent hash implementation using a configurable number of virtual
-// nodes. It is internally synchronized and thread-safe.
-type HashRing struct {
-	hasher            HasherFunc
+type subConnMember struct {
+	balancer.SubConn
+	key string
+}
+
+// Key implements consistent.Member
+// This value is what will be hashed for placement on the consistent hash ring.
+func (s subConnMember) Key() string {
+	return s.key
+}
+
+var _ consistentutils.Member = &subConnMember{}
+
+type consistentHashRingPickerBuilder struct {
+	hasher            consistentutils.HasherFunc
 	replicationFactor uint16
-
-	sync.RWMutex
-	nodes        map[string]nodeRecord
-	virtualNodes virtualNodeList
+	spread            uint8
 }
 
-// NewHashRing creates a new HashRing with the specified hasher function and replicationFactor.
-//
-// replicationFactor must be > 0 and should be a number like 20 for higher quality key distribution.
-// At a replicationFactor of 100, the standard distribution of key->member mapping will be about 10%
-// of the mean. At a replicationFactor of 1000 it will be about 3.2%. The replicationFactor should
-// be chosen carefully because a higher replicationFactor will require more memory and worse member
-// selection performance.
-func NewHashRing(hasher HasherFunc, replicationFactor uint16) *HashRing {
-	if replicationFactor < 1 {
-		panic("replicationFactor must be at least 1")
+func (b *consistentHashRingPickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
+	logger.Infof("consistentHashRingPicker: Build called with info: %v", info)
+	if len(info.ReadySCs) == 0 {
+		return base.NewErrPicker(balancer.ErrNoSubConnAvailable)
 	}
-
-	return &HashRing{
-		hasher:            hasher,
-		replicationFactor: replicationFactor,
-		nodes:             map[string]nodeRecord{},
-	}
-}
-
-// Add adds an object that implements the Member interface as a node in the
-// consistent hash ring.
-//
-// If a member with the same key is already in the hash ring,
-// ErrMemberAlreadyExists is returned.
-func (h *HashRing) Add(member Member) error {
-	nodeKeyString := member.Key()
-
-	h.Lock()
-	defer h.Unlock()
-
-	if _, ok := h.nodes[nodeKeyString]; ok {
-		// already have node, bail
-		return ErrMemberAlreadyExists
-	}
-
-	nodeHash := h.hasher([]byte(nodeKeyString))
-
-	newNodeRecord := nodeRecord{
-		nodeHash,
-		nodeKeyString,
-		member,
-		nil,
-	}
-
-	// virtualNodeBuffer is a 10-byte array, where 8 bytes are the hash value of
-	// the member key, and the final 2 bytes are an offset of the virtual node
-	// itself. This value is then hashed to get the final hash value of the virtual node.
-	virtualNodeBuffer := make([]byte, 10)
-	binary.LittleEndian.PutUint64(virtualNodeBuffer, nodeHash)
-
-	for i := uint16(0); i < h.replicationFactor; i++ {
-		binary.LittleEndian.PutUint16(virtualNodeBuffer[8:], i)
-		virtualNodeHash := h.hasher(virtualNodeBuffer)
-
-		virtualNode := virtualNode{
-			virtualNodeHash,
-			newNodeRecord,
+	hashRing := consistentutils.NewHashRing(b.hasher, b.replicationFactor)
+	for sc, scInfo := range info.ReadySCs {
+		if err := hashRing.Add(subConnMember{
+			SubConn: sc,
+			key:     scInfo.Address.Addr + scInfo.Address.ServerName,
+		}); err != nil {
+			return base.NewErrPicker(err)
 		}
-
-		newNodeRecord.virtualNodes = append(newNodeRecord.virtualNodes, virtualNode)
-		h.virtualNodes = append(h.virtualNodes, virtualNode)
 	}
-
-	sort.Sort(h.virtualNodes)
-
-	// Add the node to our map of nodes
-	h.nodes[nodeKeyString] = newNodeRecord
-
-	return nil
+	return &consistentHashRingPicker{
+		hashRing: hashRing,
+		spread:   b.spread,
+		rand:     rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
 }
 
-// Remove removes an object with the same key as the specified member object.
-//
-// If no member with the same key is in the hash ring, ErrMemberNotFound is returned.
-func (h *HashRing) Remove(member Member) error {
-	nodeKeyString := member.Key()
+type consistentHashRingPicker struct {
+	sync.Mutex
+	hashRing *consistentutils.HashRing
+	spread   uint8
+	rand     *rand.Rand
+}
 
-	h.Lock()
-	defer h.Unlock()
-
-	foundNode, ok := h.nodes[nodeKeyString]
+func (p *consistentHashRingPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+	key, ok := info.Ctx.Value(consistentHashRingCtxKey).([]byte)
 	if !ok {
-		// don't have the node, bail
-		return ErrMemberNotFound
+		panic(fmt.Sprintf("context key %s not found for consistent hash ring balancer", consistentHashRingCtxKey))
+	}
+	members, err := p.hashRing.FindN(key, p.spread)
+	if err != nil {
+		return balancer.PickResult{}, err
 	}
 
-	indexesToRemove := make([]int, 0, h.replicationFactor)
-	for _, vnode := range foundNode.virtualNodes {
-		vnodeIndex := sort.Search(len(h.virtualNodes), func(i int) bool {
-			return !h.virtualNodes[i].less(vnode)
-		})
-		if vnodeIndex >= len(h.virtualNodes) {
-			panic(fmt.Sprintf("unable to find vnode to remove: %020d:%020d:%s", vnode.hashValue, vnode.members.hashValue, vnode.members.nodeKey))
-		}
-
-		indexesToRemove = append(indexesToRemove, vnodeIndex)
+	// rand is not safe for concurrent use
+	var index int
+	if p.spread > 1 {
+		p.Lock()
+		index = p.rand.Intn(int(p.spread))
+		p.Unlock()
 	}
 
-	sort.Slice(indexesToRemove, func(i, j int) bool {
-		// NOTE: this is a reverse sort!
-		return indexesToRemove[j] < indexesToRemove[i]
-	})
-
-	if len(indexesToRemove) != int(h.replicationFactor) {
-		panic(fmt.Sprintf("found wrong number of vnodes to remove: %d != %d", len(indexesToRemove), h.replicationFactor))
-	}
-
-	for i, indexToRemove := range indexesToRemove {
-		// Swap this index for a later one
-		h.virtualNodes[indexToRemove] = h.virtualNodes[len(h.virtualNodes)-1-i]
-	}
-
-	// Truncate and sort the node list
-	h.virtualNodes = h.virtualNodes[:len(h.virtualNodes)-len(indexesToRemove)]
-	sort.Sort(h.virtualNodes)
-
-	// Remove the node from our map
-	delete(h.nodes, nodeKeyString)
-
-	return nil
+	chosen := members[index].(subConnMember)
+	return balancer.PickResult{
+		SubConn: chosen.SubConn,
+	}, nil
 }
 
-// FindN finds the first N members in the hash ring after the specified key.
-//
-// If there are not enough members in the hash ring to satisfy the request,
-// ErrNotEnoughMembers is returned.
-func (h *HashRing) FindN(key []byte, num uint8) ([]Member, error) {
-	h.RLock()
-	defer h.RUnlock()
-
-	if int(num) > len(h.nodes) {
-		return nil, ErrNotEnoughMembers
-	}
-
-	keyHash := h.hasher(key)
-
-	vnodeIndex := sort.Search(len(h.virtualNodes), func(i int) bool {
-		return h.virtualNodes[i].hashValue >= keyHash
-	})
-
-	alreadyFoundNodeKeys := map[string]struct{}{}
-	foundNodes := make([]Member, 0, num)
-	for i := 0; i < len(h.virtualNodes) && len(foundNodes) < int(num); i++ {
-		boundedIndex := (i + vnodeIndex) % len(h.virtualNodes)
-		candidate := h.virtualNodes[boundedIndex]
-		if _, ok := alreadyFoundNodeKeys[candidate.members.nodeKey]; !ok {
-			foundNodes = append(foundNodes, candidate.members.member)
-			alreadyFoundNodeKeys[candidate.members.nodeKey] = struct{}{}
-		}
-	}
-
-	return foundNodes, nil
-}
-
-// Members returns the current list of members of the HashRing.
-func (h *HashRing) Members() []Member {
-	h.RLock()
-	defer h.RUnlock()
-
-	membersCopy := make([]Member, 0, len(h.nodes))
-	for _, nodeInfo := range h.nodes {
-		membersCopy = append(membersCopy, nodeInfo.member)
-	}
-	return membersCopy
+func ContextWithConsistentHashRingKey(parent context.Context, value []byte) context.Context {
+	return context.WithValue(parent, consistentHashRingCtxKey, value)
 }
